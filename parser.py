@@ -80,11 +80,17 @@ def parse_timetable(
             continue
         header = [str(value).strip() for value in df.iloc[0].tolist()]
         day_columns: dict[int, str] = {}
+        last_day: str | None = None
         for idx, value in enumerate(header):
             day = normalize_day(value)
             if day:
+                last_day = day
                 day_columns[idx] = day
+                continue
+            if idx > 0 and last_day and not value:
+                day_columns[idx] = last_day
 
+        last_room: str | None = None
         for row_index in range(1, len(df)):
             row = [str(value) for value in df.iloc[row_index].tolist()]
             if not row:
@@ -93,11 +99,31 @@ def parse_timetable(
             if room.lower() == "nan":
                 room = ""
             if not room:
-                continue
+                has_content = any(
+                    str(cell).strip() and str(cell).strip().lower() != "nan"
+                    for cell in row[1:]
+                )
+                if has_content and last_room:
+                    room = last_room
+                else:
+                    continue
+            else:
+                last_room = room
+
+            day_values: dict[str, list[str]] = {}
             for col_idx, day in day_columns.items():
-                cell_value = row[col_idx] if col_idx < len(row) else ""
+                if col_idx >= len(row):
+                    continue
+                cell_value = row[col_idx]
                 if cell_value.lower() == "nan":
-                    cell_value = ""
+                    continue
+                cell_value = cell_value.strip()
+                if not cell_value:
+                    continue
+                day_values.setdefault(day, []).append(cell_value)
+
+            for day, parts in day_values.items():
+                cell_value = "\n".join(parts)
                 sessions = parse_cell(
                     cell_value,
                     reference_programs,
