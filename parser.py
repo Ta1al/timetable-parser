@@ -136,6 +136,7 @@ def parse_timetable(
                     session.to_dict() for session in sessions
                 )
 
+    infer_missing_semesters(timetable)
     return timetable
 
 
@@ -361,3 +362,47 @@ def parse_program_fields(program_line: str | None) -> tuple[
 
 def normalize_spacing(value: str) -> str:
     return " ".join(value.split())
+
+
+def infer_missing_semesters(timetable: dict) -> None:
+    semester_map: dict[tuple[str, str, str, str], int] = {}
+    conflicts: set[tuple[str, str, str, str]] = set()
+
+    for day_rooms in timetable.values():
+        for sessions in day_rooms.values():
+            for session in sessions:
+                key = build_semester_key(session)
+                semester = session.get("semester")
+                if not key or semester is None:
+                    continue
+                if key in semester_map and semester_map[key] != semester:
+                    conflicts.add(key)
+                else:
+                    semester_map[key] = semester
+
+    for day_rooms in timetable.values():
+        for sessions in day_rooms.values():
+            for session in sessions:
+                if session.get("semester") is not None:
+                    continue
+                key = build_semester_key(session)
+                if not key or key in conflicts:
+                    continue
+                inferred = semester_map.get(key)
+                if inferred is not None:
+                    session["semester"] = inferred
+
+
+def build_semester_key(session: dict) -> tuple[str, str, str, str] | None:
+    degree = session.get("degree")
+    program = session.get("program")
+    section = session.get("section")
+    years = session.get("session")
+    if not degree or not program or not section or not years:
+        return None
+    return (
+        normalize_spacing(str(degree)),
+        normalize_spacing(str(program)),
+        normalize_spacing(str(section)),
+        str(years).replace(" ", ""),
+    )
