@@ -270,7 +270,7 @@ def parse_session(
     program_line = None
 
     if meaningful_lines:
-        if meaningful_lines[0].startswith("Combined Class"):
+        if is_combined_header(meaningful_lines[0]):
             combined_class = meaningful_lines[0]
             course_line = meaningful_lines[1] if len(meaningful_lines) > 1 else None
             program_line = meaningful_lines[2] if len(meaningful_lines) > 2 else None
@@ -397,6 +397,13 @@ def parse_program_fields(program_line: str | None) -> tuple[
 
 def normalize_spacing(value: str) -> str:
     return " ".join(value.split())
+
+
+def is_combined_header(value: str) -> bool:
+    text = value.strip().lower()
+    if text.startswith("combined class"):
+        return True
+    return bool(re.match(r"^combined\s*\(\d+\)", text))
 
 
 def infer_missing_semesters(timetable: dict) -> None:
