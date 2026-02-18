@@ -71,14 +71,15 @@ def parse_timetable(
     keep_truncated: bool = False,
 ) -> dict:
     reference_programs = extract_program_lines(pdf_path) if resolve_truncated else []
-    tables = camelot.read_pdf(pdf_path, pages="1-end")
+    tables = extract_tables(pdf_path)
     timetable: dict[str, dict[str, list[dict]]] = {}
 
     for table in tables:
         df = table.df
         if df.empty:
             continue
-        header = [str(value).strip() for value in df.iloc[0].tolist()]
+        header_row = find_header_row(df)
+        header = [str(value).strip() for value in df.iloc[header_row].tolist()]
         day_columns: dict[int, str] = {}
         last_day: str | None = None
         for idx, value in enumerate(header):
@@ -91,7 +92,7 @@ def parse_timetable(
                 day_columns[idx] = last_day
 
         last_room: str | None = None
-        for row_index in range(1, len(df)):
+        for row_index in range(header_row + 1, len(df)):
             row = [str(value) for value in df.iloc[row_index].tolist()]
             if not row:
                 continue
@@ -140,6 +141,34 @@ def parse_timetable(
     return timetable
 
 
+def extract_tables(pdf_path: str) -> list:
+    try:
+        tables = list(camelot.read_pdf(pdf_path, pages="1-end", flavor="lattice"))
+    except Exception:
+        tables = []
+
+    if tables and any(not table.df.empty for table in tables):
+        return tables
+
+    try:
+        return list(camelot.read_pdf(pdf_path, pages="1-end", flavor="stream"))
+    except Exception:
+        return []
+
+
+def find_header_row(df) -> int:
+    best_row = 0
+    best_score = 0
+    max_rows = min(len(df), 10)
+    for row_index in range(max_rows):
+        row = [str(value).strip() for value in df.iloc[row_index].tolist()]
+        score = sum(1 for value in row if normalize_day(value))
+        if score > best_score:
+            best_score = score
+            best_row = row_index
+    return best_row
+
+
 def normalize_day(value: str) -> str | None:
     text = value.strip().lower()
     for day in DAY_NAMES:
@@ -177,7 +206,13 @@ def parse_cell(
     if not text:
         return []
 
-    lines = [line.strip() for line in text.split("\n") if line.strip()]
+    lines = [
+        line.strip()
+        for line in text.split("\n")
+        if line.strip()
+        and line.strip().lower() != " swap"
+        and not line.strip().lower().startswith("was:")
+    ]
     if not lines:
         return []
 
