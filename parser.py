@@ -6,6 +6,7 @@ from typing import Iterable
 
 import camelot
 import pdfplumber
+from datetime import datetime
 
 DAY_NAMES = [
     "Monday",
@@ -138,7 +139,10 @@ def parse_timetable(
                 )
 
     infer_missing_semesters(timetable)
-    return timetable
+
+    # attach a timestamp at top-level so consumers can know when this data was generated
+    # use ISO format for easy parsing and ordering
+    return {"timestamp": datetime.now().isoformat(), **timetable}
 
 
 def extract_tables(pdf_path: str) -> list:
