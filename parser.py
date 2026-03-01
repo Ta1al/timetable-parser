@@ -216,6 +216,8 @@ def parse_cell(
         if line.strip()
         and line.strip().lower() != " swap"
         and not line.strip().lower().startswith("was:")
+        # ignore stray delete boxes which can appear in some PDFs
+        and "delete" not in line.strip().lower()
     ]
     if not lines:
         return []
