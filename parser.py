@@ -84,8 +84,15 @@ def parse_timetable(
     resolve_truncated: bool = True,
     keep_truncated: bool = False,
 ) -> dict:
-    reference_programs = extract_program_lines(pdf_path) if resolve_truncated else []
     tables = extract_tables(pdf_path)
+    # The updated PDF puts the program picker on page 1 and wraps its entries
+    # across several visual lines.  The timetable cells themselves contain
+    # complete program lines, so use them as the authoritative references for
+    # resolving ellipsized values.  Keep page 1 as a supplemental source for
+    # PDFs where a program occurs only in the picker.
+    reference_programs = (
+        collect_program_references(pdf_path, tables) if resolve_truncated else []
+    )
     timetable: dict[str, dict[str, list[dict]]] = {}
 
     last_room: str | None = None
@@ -144,6 +151,11 @@ def parse_timetable(
                 )
                 if has_content and last_room:
                     room = last_room
+                elif is_stream_table and has_content:
+                    # Some stream tables place the room label after the
+                    # first block of classes. Keep those cells until the
+                    # label arrives instead of dropping the first room.
+                    room = ""
                 else:
                     continue
             else:
@@ -275,10 +287,23 @@ def extract_tables(pdf_path: str) -> list:
     for page in sorted(tables_by_page):
         page_tables = tables_by_page[page]
         lattice_tables = [table for flavor, table in page_tables if flavor == "lattice"]
+        stream_tables = [table for flavor, table in page_tables if flavor == "stream"]
         pdfplumber_tables = [
             table for flavor, table in page_tables if flavor == "pdfplumber"
         ]
-        selected.extend(lattice_tables or pdfplumber_tables or [table for _, table in page_tables])
+        # Stream can recover a timetable that shares a page with non-table
+        # metadata (notably the first room on the updated PDF).  In that case
+        # the day-header row is below the first row; otherwise pdfplumber is
+        # generally more reliable for the regular timetable pages.
+        stream_with_metadata = [
+            table for table in stream_tables if find_header_row(table.df) > 0
+        ]
+        selected.extend(
+            lattice_tables
+            or stream_with_metadata
+            or pdfplumber_tables
+            or [table for _, table in page_tables]
+        )
     return selected
 
 
@@ -328,6 +353,28 @@ def extract_program_lines(pdf_path: str) -> list[str]:
         if SESSION_RE.search(line) and SEMESTER_RE.search(line):
             candidates.append(line)
     return candidates
+
+
+def collect_program_references(pdf_path: str, tables: Iterable) -> list[str]:
+    """Collect full program lines from page metadata and timetable cells."""
+    references: list[str] = []
+    seen: set[str] = set()
+
+    def add(value: str) -> None:
+        value = normalize_spacing(value)
+        if value and looks_like_program_line(value) and value not in seen:
+            seen.add(value)
+            references.append(value)
+
+    for value in extract_program_lines(pdf_path):
+        add(value)
+
+    for table in tables:
+        for value in table.df.astype(str).to_numpy().flat:
+            for line in str(value).splitlines():
+                add(line.strip())
+
+    return references
 
 
 def parse_cell(
