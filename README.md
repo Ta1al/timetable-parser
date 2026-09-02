@@ -1,6 +1,6 @@
 # Timetable Parser
 
-Parses timetable PDFs into structured JSON using Camelot and pdfplumber.
+Parses timetable PDFs into structured JSON using positioned text from pdfplumber.
 
 ## Setup
 
@@ -10,11 +10,12 @@ Install dependencies:
 pip install -r requirements.txt
 ```
 
-> Note: `camelot-py` requires Ghostscript and additional system packages on some platforms.
+Pass `--report path/to/report.json` when you want a parsing diagnostics report.
 
 ## Usage
 
 ```bash
-python parse_timetable.py samples/timetable.pdf -o samples/timetable.parsed.json --keep-truncated
+python parse_timetable.py samples/newweek1.pdf -o samples/newweek1.parsed.json
 ```
 
+The report is optional and is not created unless `--report` is supplied.
