@@ -4,7 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
-from parser import parse_timetable
+from parser import parse_timetable_with_report
 
 
 def main() -> None:
@@ -16,14 +16,8 @@ def main() -> None:
         help="Path to write JSON output. Defaults to <pdf>.json",
     )
     parser.add_argument(
-        "--keep-truncated",
-        action="store_true",
-        help="Keep truncated program lines even if a full match is found.",
-    )
-    parser.add_argument(
-        "--no-resolve-truncated",
-        action="store_true",
-        help="Disable resolving truncated program lines from the first page.",
+        "--report",
+        help="Path to write the parsing report. Defaults to <output>.report.json",
     )
 
     args = parser.parse_args()
@@ -32,16 +26,17 @@ def main() -> None:
         Path(args.output) if args.output else pdf_path.with_suffix(".json")
     )
 
-    timetable = parse_timetable(
-        str(pdf_path),
-        resolve_truncated=not args.no_resolve_truncated,
-        keep_truncated=args.keep_truncated,
-    )
+    timetable, report = parse_timetable_with_report(str(pdf_path))
 
     output_path.write_text(
         json.dumps(timetable, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
+    if args.report:
+        Path(args.report).write_text(
+            json.dumps(report, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
 
 
 if __name__ == "__main__":
