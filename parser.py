@@ -1,37 +1,22 @@
 from __future__ import annotations
 
 import re
+from collections import defaultdict
 from dataclasses import dataclass
-from types import SimpleNamespace
+from datetime import datetime
 from typing import Iterable
 
-import camelot
-import pandas as pd
 import pdfplumber
-from datetime import datetime
 
-DAY_NAMES = [
-    "Monday",
-    "Tuesday",
-    "Wednesday",
-    "Thursday",
-    "Friday",
-    "Saturday",
-    "Sunday",
-]
-
+DAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 TIME_RE = re.compile(r"\((\d{2}:\d{2})\s*-\s*(\d{2}:\d{2})\)")
 SESSION_RE = re.compile(r"\b(\d{4})\s*-\s*(\d{4})\b")
 SEMESTER_RE = re.compile(r"Semester#\s*(\d+)")
 DEGREE_RE = re.compile(r"^(BS|MS|PhD)\s+(?:in\s+)?", re.IGNORECASE)
 SECTION_RE = re.compile(r"(Regular|Self Support)\s*\d+", re.IGNORECASE)
 
-PROGRAM_CODES = {
-    "computer science - specialization in artificial intelligence": "AI",
-}
-PROGRAM_NAMES = {
-    "computer science - specialization in artificial intelligence": "Artificial Intelligence",
-}
+PROGRAM_CODES = {"computer science - specialization in artificial intelligence": "AI"}
+PROGRAM_NAMES = {"computer science - specialization in artificial intelligence": "Artificial Intelligence"}
 
 
 @dataclass
@@ -56,629 +41,381 @@ class ParsedSession:
     raw_lines: list[str]
 
     def to_dict(self) -> dict:
-        return {
-            "combined_class": self.combined_class,
-            "course_title": self.course_title,
-            "course_code": self.course_code,
-            "course_truncated": self.course_truncated,
-            "program_line": self.program_line,
-            "program_truncated": self.program_truncated,
-            "degree": self.degree,
-            "program": self.program,
-            "program_code": self.program_code,
-            "section": self.section,
-            "session": self.session,
-            "semester": self.semester,
-            "teacher_name": self.teacher_name,
-            "teacher_truncated": self.teacher_truncated,
-            "start_time": self.start_time,
-            "end_time": self.end_time,
-            "practical": self.practical,
-            "raw_lines": self.raw_lines,
-        }
+        return self.__dict__.copy()
 
 
-def parse_timetable(
-    pdf_path: str,
-    *,
-    resolve_truncated: bool = True,
-    keep_truncated: bool = False,
-) -> dict:
-    tables = extract_tables(pdf_path)
-    # The updated PDF puts the program picker on page 1 and wraps its entries
-    # across several visual lines.  The timetable cells themselves contain
-    # complete program lines, so use them as the authoritative references for
-    # resolving ellipsized values.  Keep page 1 as a supplemental source for
-    # PDFs where a program occurs only in the picker.
-    reference_programs = (
-        collect_program_references(pdf_path, tables) if resolve_truncated else []
+@dataclass
+class Candidate:
+    page: int
+    region: int
+    day: str
+    top: float
+    lines: list[str]
+
+
+def parse_timetable(pdf_path: str, *, resolve_truncated: bool = True, keep_truncated: bool = False) -> dict:
+    timetable, _ = parse_timetable_with_report(
+        pdf_path, resolve_truncated=resolve_truncated, keep_truncated=keep_truncated
     )
+    return timetable
+
+
+def parse_timetable_with_report(
+    pdf_path: str, *, resolve_truncated: bool = True, keep_truncated: bool = False
+) -> tuple[dict, dict]:
+    candidates, report = extract_candidates(pdf_path)
+    references = unique_program_lines(line for item in candidates for line in item.lines)
     timetable: dict[str, dict[str, list[dict]]] = {}
 
-    last_room: str | None = None
-    pending_room_prefix: str | None = None
-    pending_stream_blocks: list[tuple[str, str]] = []
-    for table in tables:
-        df = table.df
-        if df.empty:
+    for candidate in candidates:
+        room = candidate_room(candidate, report["rooms"])
+        if not room:
+            report["warnings"].append({
+                "type": "unassigned_session", "page": candidate.page,
+                "region": candidate.region, "day": candidate.day,
+                "top": round(candidate.top, 1), "lines": candidate.lines,
+            })
             continue
-        header_row = find_header_row(df)
-        header = [str(value).strip() for value in df.iloc[header_row].tolist()]
-        day_columns: dict[int, str] = {}
-        last_day: str | None = None
-        for idx, value in enumerate(header):
-            day = normalize_day(value)
-            if day:
-                last_day = day
-                day_columns[idx] = day
-                continue
-            if idx > 0 and last_day and not value:
-                day_columns[idx] = last_day
-
-        stream_parts: dict[str, list[str]] = {}
-        is_stream_table = getattr(table, "_parser_flavor", None) == "stream"
-        for row_index in range(header_row + 1, len(df)):
-            row = [str(value) for value in df.iloc[row_index].tolist()]
-            if not row:
-                continue
-            room = normalize_spacing(row[0].replace("\n", " ")).strip()
-            if room.lower() in {"nan", ""}:
-                room = ""
-            room_label_completed = bool(room)
-            if pending_room_prefix and room:
-                if is_room_prefix(room):
-                    pending_room_prefix = room
-                    room = last_room or ""
-                    room_label_completed = False
-                else:
-                    room = normalize_spacing(f"{pending_room_prefix} {room}")
-                    pending_room_prefix = (
-                        room if is_room_prefix(room) else None
-                    )
-                    room_label_completed = pending_room_prefix is None
-
-            # Stream extraction may place a department prefix in one row and
-            # its room number in a later row. Keep using the previous room
-            # until the complete label is available.
-            if is_room_prefix(room):
-                pending_room_prefix = room
-                room = last_room or ""
-                room_label_completed = False
-            if not room:
-                has_content = any(
-                    str(cell).strip() and str(cell).strip().lower() != "nan"
-                    for cell in row[1:]
-                )
-                if has_content and last_room:
-                    room = last_room
-                elif is_stream_table and has_content:
-                    # Some stream tables place the room label after the
-                    # first block of classes. Keep those cells until the
-                    # label arrives instead of dropping the first room.
-                    room = ""
-                else:
-                    continue
-            else:
-                last_room = room
-
-            day_values: dict[str, list[str]] = {}
-            for col_idx, day in day_columns.items():
-                if col_idx >= len(row):
-                    continue
-                cell_value = row[col_idx]
-                if cell_value.lower() == "nan":
-                    continue
-                cell_value = cell_value.strip()
-                if not cell_value:
-                    continue
-                day_values.setdefault(day, []).append(cell_value)
-
-            if is_stream_table:
-                for day, parts in day_values.items():
-                    stream_parts.setdefault(day, []).extend(parts)
-                if any("" in value for value in row):
-                    for day, parts in stream_parts.items():
-                        pending_stream_blocks.append((day, "\n".join(parts)))
-                    stream_parts.clear()
-                if room_label_completed and pending_stream_blocks:
-                    for day, cell_value in pending_stream_blocks:
-                        add_parsed_sessions(
-                            timetable, day, room, cell_value,
-                            reference_programs, resolve_truncated, keep_truncated,
-                        )
-                    pending_stream_blocks.clear()
-                continue
-
-            for day, parts in day_values.items():
-                add_parsed_sessions(
-                    timetable, day, room, "\n".join(parts),
-                    reference_programs, resolve_truncated, keep_truncated,
-                )
-
-        for day, parts in stream_parts.items():
-            pending_stream_blocks.append((day, "\n".join(parts)))
-
-    for day, cell_value in pending_stream_blocks:
-        add_parsed_sessions(
-            timetable, day, last_room, cell_value,
-            reference_programs, resolve_truncated, keep_truncated,
+        sessions = parse_cell(
+            "\n".join(candidate.lines), references,
+            resolve_truncated=resolve_truncated, keep_truncated=keep_truncated,
+        )
+        if not sessions:
+            report["warnings"].append({
+                "type": "malformed_session", "page": candidate.page,
+                "region": candidate.region, "day": candidate.day,
+                "room": room, "top": round(candidate.top, 1),
+                "lines": candidate.lines,
+            })
+            continue
+        timetable.setdefault(candidate.day, {}).setdefault(room, []).extend(
+            item.to_dict() for item in sessions
         )
 
     infer_missing_semesters(timetable)
-
-    # attach a timestamp at top-level so consumers can know when this data was generated
-    # use ISO format for easy parsing and ordering
-    return {"timestamp": datetime.now().isoformat(), **timetable}
-
-
-def add_parsed_sessions(
-    timetable: dict,
-    day: str,
-    room: str | None,
-    cell_value: str,
-    reference_programs: Iterable[str],
-    resolve_truncated: bool,
-    keep_truncated: bool,
-) -> None:
-    if not room:
-        return
-    sessions = parse_cell(
-        cell_value,
-        reference_programs,
-        resolve_truncated=resolve_truncated,
-        keep_truncated=keep_truncated,
-    )
-    if sessions:
-        timetable.setdefault(day, {}).setdefault(room, []).extend(
-            session.to_dict() for session in sessions
-        )
-
-
-def extract_tables(pdf_path: str) -> list:
-    """Extract the best table set for each page.
-
-    Lattice preserves merged room cells well, but may miss entire pages when
-    their borders differ. Stream handles those pages, although it can split
-    merged room labels. Selecting per page keeps both advantages.
-    """
-    extracted: dict[str, list] = {}
-    for flavor in ("lattice", "stream"):
-        try:
-            tables = list(camelot.read_pdf(pdf_path, pages="1-end", flavor=flavor))
-        except Exception:
-            tables = []
-        if tables:
-            for table in tables:
-                table._parser_flavor = flavor
-            extracted[flavor] = tables
-
-    if not extracted:
-        return []
-
-    tables_by_page: dict[int, list] = {}
-    for flavor in ("lattice", "stream"):
-        for table in extracted.get(flavor, []):
-            if find_header_score(table.df) >= 2:
-                tables_by_page.setdefault(table.page, []).append((flavor, table))
-
-    lattice_pages = {
-        page for page, page_tables in tables_by_page.items()
-        if any(flavor == "lattice" for flavor, _ in page_tables)
+    report["summary"] = {
+        "pages": report.pop("page_count"),
+        "regions": len(report["regions"]),
+        "rooms": len({item["room"] for item in report["rooms"]}),
+        "sessions": sum(len(items) for rooms in timetable.values() for items in rooms.values()),
+        "warnings": len(report["warnings"]),
     }
-    try:
-        with pdfplumber.open(pdf_path) as pdf:
-            for page_number, page in enumerate(pdf.pages, start=1):
-                if page_number in lattice_pages:
-                    continue
-                for table_data in page.extract_tables():
-                    table = SimpleNamespace(
-                        df=pd.DataFrame(table_data),
-                        page=page_number,
-                        _parser_flavor="pdfplumber",
-                    )
-                    if find_header_score(table.df) >= 2:
-                        tables_by_page.setdefault(page_number, []).append(
-                            ("pdfplumber", table)
-                        )
-    except Exception:
-        pass
+    report["status"] = "failed" if not candidates else ("partial" if report["warnings"] else "clean")
+    return {"timestamp": datetime.now().isoformat(), **timetable}, report
 
-    selected = []
-    for page in sorted(tables_by_page):
-        page_tables = tables_by_page[page]
-        lattice_tables = [table for flavor, table in page_tables if flavor == "lattice"]
-        stream_tables = [table for flavor, table in page_tables if flavor == "stream"]
-        pdfplumber_tables = [
-            table for flavor, table in page_tables if flavor == "pdfplumber"
-        ]
-        # Stream can recover a timetable that shares a page with non-table
-        # metadata (notably the first room on the updated PDF).  In that case
-        # the day-header row is below the first row; otherwise pdfplumber is
-        # generally more reliable for the regular timetable pages.
-        stream_with_metadata = [
-            table for table in stream_tables if find_header_row(table.df) > 0
-        ]
-        selected.extend(
-            lattice_tables
-            or stream_with_metadata
-            or pdfplumber_tables
-            or [table for _, table in page_tables]
-        )
+
+def extract_candidates(pdf_path: str) -> tuple[list[Candidate], dict]:
+    report: dict = {"status": "failed", "regions": [], "rooms": [], "warnings": [], "page_count": 0}
+    candidates: list[Candidate] = []
+    try:
+        pdf = pdfplumber.open(pdf_path)
+    except Exception as exc:
+        report["warnings"].append({"type": "pdf_open_error", "message": str(exc)})
+        return candidates, report
+
+    with pdf:
+        report["page_count"] = len(pdf.pages)
+        for page_number, page in enumerate(pdf.pages, start=1):
+            words = page.extract_words(use_text_flow=True, keep_blank_chars=False)
+            lines = make_lines(words)
+            headers = find_day_headers(lines)
+            for region, header in enumerate(headers, start=1):
+                next_top = headers[region]["top"] if region < len(headers) else page.height
+                day_bounds = day_boundaries(header["days"], page.width)
+                report["regions"].append({
+                    "page": page_number, "region": region,
+                    "top": round(header["top"], 1),
+                    "days": [day for day, _ in header["days"]],
+                })
+                region_lines = [
+                    line for line in lines
+                    if line["top"] > header["top"] + 1 and line["top"] < next_top - 1
+                ]
+                rooms = find_rooms(region_lines, day_bounds, page_number, region)
+                report["rooms"].extend(rooms)
+                if not rooms:
+                    report["warnings"].append({
+                        "type": "missing_room_label", "page": page_number, "region": region
+                    })
+                for day, (left, right) in day_bounds.items():
+                    day_lines = crop_lines(region_lines, left, right)
+                    candidates.extend(make_candidates(page_number, region, day, day_lines))
+    return candidates, report
+
+
+def make_lines(words: list[dict], tolerance: float = 1.5) -> list[dict]:
+    """Group positioned PDF words into readable visual lines."""
+    groups: list[list[dict]] = []
+    for word in sorted(words, key=lambda value: (value["top"], value["x0"])):
+        if groups and abs(groups[-1][0]["top"] - word["top"]) <= tolerance:
+            groups[-1].append(word)
+        else:
+            groups.append([word])
+    return [
+        {
+            "top": min(word["top"] for word in group),
+            "bottom": max(word["bottom"] for word in group),
+            "x0": min(word["x0"] for word in group),
+            "x1": max(word["x1"] for word in group),
+            "words": sorted(group, key=lambda value: value["x0"]),
+        }
+        for group in groups
+    ]
+
+
+def find_day_headers(lines: list[dict]) -> list[dict]:
+    headers: list[dict] = []
+    for line in lines:
+        days = []
+        for word in line["words"]:
+            day = normalize_day(word["text"])
+            if day:
+                days.append((day, (word["x0"] + word["x1"]) / 2))
+        if len(days) >= 2:
+            headers.append({"top": line["top"], "days": days})
+    # A header may be represented by several nearby text lines; retain the
+    # line with the most distinct days in each vertical band.
+    selected: list[dict] = []
+    for header in headers:
+        if selected and header["top"] - selected[-1]["top"] < 25:
+            if len(header["days"]) > len(selected[-1]["days"]):
+                selected[-1] = header
+        else:
+            selected.append(header)
     return selected
 
 
-def find_header_score(df) -> int:
-    header_row = find_header_row(df)
-    return sum(
-        1
-        for value in df.iloc[header_row].tolist()
-        if normalize_day(str(value).strip())
+def day_boundaries(days: list[tuple[str, float]], page_width: float) -> dict[str, tuple[float, float]]:
+    days = sorted(days, key=lambda item: item[1])
+    result: dict[str, tuple[float, float]] = {}
+    for index, (day, center) in enumerate(days):
+        left = (
+            max(0, center - (days[index + 1][1] - center) / 2)
+            if index == 0 else (days[index - 1][1] + center) / 2
+        )
+        right = (
+            min(page_width, center + (center - days[index - 1][1]) / 2)
+            if index == len(days) - 1 else (center + days[index + 1][1]) / 2
+        )
+        result[day] = (left, right)
+    return result
+
+
+def crop_lines(lines: list[dict], left: float, right: float) -> list[tuple[float, str]]:
+    result = []
+    for line in lines:
+        words = [word for word in line["words"] if left <= (word["x0"] + word["x1"]) / 2 < right]
+        if words:
+            result.append((line["top"], " ".join(word["text"] for word in words)))
+    return result
+
+
+def make_candidates(page: int, region: int, day: str, lines: list[tuple[float, str]]) -> list[Candidate]:
+    result: list[Candidate] = []
+    pending: list[str] = []
+    top = 0.0
+    for line_top, text in lines:
+        text = normalize_spacing(text)
+        if not text:
+            continue
+        if not pending:
+            top = line_top
+        pending.append(text)
+        if TIME_RE.search(text):
+            result.append(Candidate(page, region, day, top, pending))
+            pending = []
+    return result
+
+
+def find_rooms(lines: list[dict], day_bounds: dict[str, tuple[float, float]], page: int, region: int) -> list[dict]:
+    first_day_left = min(left for left, _ in day_bounds.values())
+    left_lines = []
+    for line in lines:
+        words = [word for word in line["words"] if (word["x0"] + word["x1"]) / 2 < first_day_left]
+        if words:
+            left_lines.append((line["top"], " ".join(word["text"] for word in words)))
+
+    blocks: list[list[tuple[float, str]]] = []
+    for item in left_lines:
+        if blocks and item[0] - blocks[-1][-1][0] <= 14:
+            blocks[-1].append(item)
+        else:
+            blocks.append([item])
+    rooms = []
+    for block in blocks:
+        text = normalize_spacing(" ".join(value for _, value in block))
+        if looks_like_room(text):
+            rooms.append({
+                "page": page, "region": region, "room": normalize_room_label(text),
+                "top": sum(value for value, _ in block) / len(block),
+            })
+    return rooms
+
+
+def looks_like_room(value: str) -> bool:
+    text = value.lower()
+    if text.startswith("room / lab"):
+        return False
+    return bool(re.search(r"\b(?:cr|l|lab|room|hall)[\s-]*[a-z0-9]", text))
+
+
+def normalize_room_label(value: str) -> str:
+    """Restore labels whose PDF words are emitted in column, not reading, order."""
+    value = normalize_spacing(value)
+    department = re.search(
+        r"\bDepartment of [A-Za-z ]+?(?=\s+(?:CR-|L-|Lab|Room|Hall)|\s+\d+$|$)",
+        value,
     )
+    if not department or department.start() == 0:
+        return value
+    prefix = value[:department.start()].strip()
+    suffix = value[department.end():].strip()
+    return normalize_spacing(f"{department.group(0)} {prefix} {suffix}")
 
 
-def find_header_row(df) -> int:
-    best_row = 0
-    best_score = 0
-    max_rows = min(len(df), 10)
-    for row_index in range(max_rows):
-        row = [str(value).strip() for value in df.iloc[row_index].tolist()]
-        score = sum(1 for value in row if normalize_day(value))
-        if score > best_score:
-            best_score = score
-            best_row = row_index
-    return best_row
-
-
-def normalize_day(value: str) -> str | None:
-    text = value.strip().lower()
-    for day in DAY_NAMES:
-        if text.startswith(day.lower()):
-            return day
+def candidate_room(candidate: Candidate, rooms: list[dict]) -> str | None:
+    matches = [item for item in rooms if item["page"] == candidate.page and item["region"] == candidate.region]
+    if not matches:
+        return None
+    matches.sort(key=lambda item: item["top"])
+    if len(matches) == 1:
+        return matches[0]["room"]
+    for index, item in enumerate(matches):
+        lower = float("-inf") if index == 0 else (matches[index - 1]["top"] + item["top"]) / 2
+        upper = float("inf") if index == len(matches) - 1 else (item["top"] + matches[index + 1]["top"]) / 2
+        if lower <= candidate.top < upper:
+            return item["room"]
     return None
 
 
-def extract_program_lines(pdf_path: str) -> list[str]:
-    try:
-        with pdfplumber.open(pdf_path) as pdf:
-            if not pdf.pages:
-                return []
-            text = pdf.pages[0].extract_text() or ""
-    except Exception:
-        return []
-
-    candidates: list[str] = []
-    for line in (line.strip() for line in text.splitlines()):
-        if not line:
-            continue
-        if SESSION_RE.search(line) and SEMESTER_RE.search(line):
-            candidates.append(line)
-    return candidates
+def unique_program_lines(lines: Iterable[str]) -> list[str]:
+    result, seen = [], set()
+    for line in lines:
+        line = normalize_spacing(line)
+        if looks_like_program_line(line) and line not in seen:
+            seen.add(line)
+            result.append(line)
+    return result
 
 
-def collect_program_references(pdf_path: str, tables: Iterable) -> list[str]:
-    """Collect full program lines from page metadata and timetable cells."""
-    references: list[str] = []
-    seen: set[str] = set()
-
-    def add(value: str) -> None:
-        value = normalize_spacing(value)
-        if value and looks_like_program_line(value) and value not in seen:
-            seen.add(value)
-            references.append(value)
-
-    for value in extract_program_lines(pdf_path):
-        add(value)
-
-    for table in tables:
-        for value in table.df.astype(str).to_numpy().flat:
-            for line in str(value).splitlines():
-                add(line.strip())
-
-    return references
-
-
-def parse_cell(
-    cell_value: str,
-    reference_programs: Iterable[str],
-    *,
-    resolve_truncated: bool,
-    keep_truncated: bool,
-) -> list[ParsedSession]:
-    text = str(cell_value or "").strip()
-    if not text:
-        return []
-
+def parse_cell(cell_value: str, reference_programs: Iterable[str], *, resolve_truncated: bool, keep_truncated: bool) -> list[ParsedSession]:
     lines = [
-        line.strip()
-        for line in text.split("\n")
-        if line.strip()
-        and line.strip() != ""
-        and line.strip().lower() != " swap"
-        and not line.strip().lower().startswith("was:")
-        # ignore stray delete boxes which can appear in some PDFs
-        and "delete" not in line.strip().lower()
+        line.strip() for line in str(cell_value or "").split("\n")
+        if line.strip() and line.strip() != "" and "delete" not in line.lower()
     ]
-    if not lines:
-        return []
-
-    sessions: list[list[str]] = []
-    current: list[str] = []
+    sessions, current = [], []
     for line in lines:
         current.append(line)
         if TIME_RE.search(line):
             sessions.append(current)
             current = []
-
-    if current and any(TIME_RE.search(line) for line in current):
-        sessions.append(current)
-
-    return [
-        parse_session(
-            session_lines,
-            reference_programs,
-            resolve_truncated=resolve_truncated,
-            keep_truncated=keep_truncated,
-        )
-        for session_lines in sessions
-    ]
+    return [parse_session(item, reference_programs, resolve_truncated=resolve_truncated, keep_truncated=keep_truncated) for item in sessions]
 
 
-def parse_session(
-    raw_lines: list[str],
-    reference_programs: Iterable[str],
-    *,
-    resolve_truncated: bool,
-    keep_truncated: bool,
-) -> ParsedSession:
-    raw_lines_clean = [line.strip() for line in raw_lines if line.strip()]
-
-    content_lines = [line for line in raw_lines_clean]
-    teacher_line = None
-    teacher_index = None
-    for idx, line in enumerate(content_lines):
-        if TIME_RE.search(line):
-            teacher_line = line
-            teacher_index = idx
-
-    if teacher_index is not None:
-        content_lines = [line for idx, line in enumerate(content_lines) if idx != teacher_index]
-
-    practical = any(line.strip().lower() == "practical" for line in content_lines)
-    content_lines = [
-        line for line in content_lines if line.strip().lower() != "practical"
-    ]
-
-    meaningful_lines = [line for line in content_lines if line != ""]
-
-    combined_class = None
-    course_line = None
-    program_line = None
-
-    if meaningful_lines and is_combined_header(meaningful_lines[0]):
-        combined_class = meaningful_lines.pop(0)
-
-    # PDF extraction can return the course and program lines in either order.
-    program_index = next(
-        (idx for idx, line in enumerate(meaningful_lines) if looks_like_program_line(line)),
-        None,
-    )
-    if program_index is not None:
-        program_line = meaningful_lines.pop(program_index)
-    course_line = next((line for line in meaningful_lines if "#" in line), None)
-    if course_line is None and meaningful_lines:
-        course_line = meaningful_lines[0]
-
+def parse_session(raw_lines: list[str], reference_programs: Iterable[str], *, resolve_truncated: bool, keep_truncated: bool) -> ParsedSession:
+    lines = [line.strip() for line in raw_lines if line.strip()]
+    teacher_index = next((i for i in range(len(lines) - 1, -1, -1) if TIME_RE.search(lines[i])), None)
+    teacher_line = lines.pop(teacher_index) if teacher_index is not None else None
+    practical = any("practical" in line.lower() for line in lines)
+    lines = [line for line in lines if line.lower() != "practical"]
+    combined = lines.pop(0) if lines and is_combined_header(lines[0]) else None
+    program_index = next((i for i, line in enumerate(lines) if looks_like_program_line(line)), None)
+    program_line = lines.pop(program_index) if program_index is not None else None
+    course_line = next((line for line in lines if "#" in line), lines[0] if lines else None)
     course_title, course_code = split_course_line(course_line)
-    course_truncated = has_ellipsis(course_title)
-
     raw_program_line = program_line
     program_truncated = has_ellipsis(raw_program_line)
-    if resolve_truncated and program_truncated and raw_program_line:
-        resolved = resolve_program_line(raw_program_line, reference_programs)
-        if not keep_truncated:
-            program_line = resolved
-
+    if resolve_truncated and raw_program_line and program_truncated and not keep_truncated:
+        program_line = resolve_program_line(raw_program_line, reference_programs)
     degree, program, section, session, semester = parse_program_fields(program_line)
     program_code = get_program_code(degree, program)
     if program_code and program:
         program = PROGRAM_NAMES.get(normalize_spacing(program).lower(), program)
-
-    teacher_name = None
-    start_time = None
-    end_time = None
-    if teacher_line:
-        time_match = TIME_RE.search(teacher_line)
-        if time_match:
-            start_time, end_time = time_match.groups()
-        teacher_name = teacher_line.split("(")[0].strip() or None
-
-    teacher_truncated = has_ellipsis(teacher_name)
-
-    return ParsedSession(
-        combined_class=combined_class,
-        course_title=course_title,
-        course_code=course_code,
-        course_truncated=course_truncated,
-        program_line=program_line,
-        program_truncated=program_truncated,
-        degree=degree,
-        program=program,
-        program_code=program_code,
-        section=section,
-        session=session,
-        semester=semester,
-        teacher_name=teacher_name,
-        teacher_truncated=teacher_truncated,
-        start_time=start_time,
-        end_time=end_time,
-        practical=practical,
-        raw_lines=raw_lines_clean,
-    )
+    match = TIME_RE.search(teacher_line or "")
+    teacher_name = (teacher_line or "").split("(")[0].strip() or None
+    return ParsedSession(combined, course_title, course_code, has_ellipsis(course_title), program_line,
+        program_truncated, degree, program, program_code, section, session, semester, teacher_name,
+        has_ellipsis(teacher_name), match.group(1) if match else None, match.group(2) if match else None,
+        practical, raw_lines)
 
 
-def split_course_line(course_line: str | None) -> tuple[str | None, str | None]:
-    if not course_line:
+def split_course_line(value: str | None) -> tuple[str | None, str | None]:
+    if not value:
         return None, None
-    if "#" not in course_line:
-        return course_line.strip(), None
-    left, right = course_line.rsplit("#", 1)
-    return left.strip() or None, right.strip() or None
+    if "#" not in value:
+        return value.strip(), None
+    title, code = value.rsplit("#", 1)
+    return title.strip() or None, code.strip() or None
 
 
-def has_ellipsis(text: str | None) -> bool:
-    if not text:
-        return False
-    return "…" in text or text.endswith("...")
+def has_ellipsis(value: str | None) -> bool:
+    return bool(value and ("…" in value or value.endswith("...")))
 
 
-def resolve_program_line(program_line: str, reference_programs: Iterable[str]) -> str:
+def resolve_program_line(program_line: str, references: Iterable[str]) -> str:
     prefix = program_line.replace("…", "").strip()
-    session_match = SESSION_RE.search(program_line)
-    semester_match = SEMESTER_RE.search(program_line)
-    session_value = session_match.group(0) if session_match else None
-    semester_value = semester_match.group(0).replace(" ", "") if semester_match else None
-
-    for candidate in reference_programs:
-        if not looks_like_program_line(candidate):
-            continue
-        if session_value and session_value not in candidate:
-            continue
-        candidate_compact = candidate.replace(" ", "")
-        if semester_value and semester_value not in candidate_compact:
-            continue
+    session = SESSION_RE.search(program_line)
+    semester = SEMESTER_RE.search(program_line)
+    for candidate in references:
         if prefix and candidate.startswith(prefix):
             return candidate
-
-    for candidate in reference_programs:
-        if not looks_like_program_line(candidate):
-            continue
-        if session_value and session_value in candidate:
-            if not semester_value or semester_value in candidate.replace(" ", ""):
-                return candidate
-
+        if session and session.group(0) in candidate and semester and semester.group(1) in candidate:
+            return candidate
     return program_line
 
 
-def parse_program_fields(program_line: str | None) -> tuple[
-    str | None,
-    str | None,
-    str | None,
-    str | None,
-    int | None,
-]:
-    if not program_line:
+def parse_program_fields(value: str | None) -> tuple[str | None, str | None, str | None, str | None, int | None]:
+    if not value:
         return None, None, None, None, None
-
-    cleaned = " ".join(program_line.replace("(", " ( ").replace(")", " ) ").split())
-
+    cleaned = normalize_spacing(value.replace("(", " ( ").replace(")", " ) "))
     degree_match = DEGREE_RE.match(cleaned)
     if not degree_match:
         return None, None, None, None, None
-
     degree = degree_match.group(1)
     remainder = cleaned[degree_match.end():]
     section_match = SECTION_RE.search(remainder)
-    program = None
-    section = None
-    if section_match:
-        program = remainder[: section_match.start()].strip() or None
-        section = normalize_spacing(section_match.group(0))
-
-    session_match = SESSION_RE.search(cleaned)
-    session = session_match.group(0).replace(" ", "") if session_match else None
-
-    semester_match = SEMESTER_RE.search(cleaned)
-    semester = int(semester_match.group(1)) if semester_match else None
-
-    return degree, program, section, session, semester
+    program = remainder[:section_match.start()].strip() if section_match else None
+    section = normalize_spacing(section_match.group(0)) if section_match else None
+    session_match, semester_match = SESSION_RE.search(cleaned), SEMESTER_RE.search(cleaned)
+    return degree, program or None, section, session_match.group(0).replace(" ", "") if session_match else None, int(semester_match.group(1)) if semester_match else None
 
 
 def looks_like_program_line(value: str) -> bool:
-    """Return whether a PDF line contains the identifying program metadata."""
     return bool(DEGREE_RE.match(value.strip()) and SESSION_RE.search(value))
 
 
 def get_program_code(degree: str | None, program: str | None) -> str | None:
-    if not degree or not program:
-        return None
-    normalized = normalize_spacing(program).lower()
-    suffix = PROGRAM_CODES.get(normalized)
-    return suffix
+    return PROGRAM_CODES.get(normalize_spacing(program).lower()) if degree and program else None
+
+
+def is_combined_header(value: str) -> bool:
+    return value.lower().startswith("combined class") or bool(re.match(r"^combined\s*\(\d+\)", value.lower()))
+
+
+def normalize_day(value: str) -> str | None:
+    return next((day for day in DAY_NAMES if value.strip().lower().startswith(day.lower())), None)
 
 
 def normalize_spacing(value: str) -> str:
     return " ".join(value.split())
 
 
-def is_room_prefix(value: str) -> bool:
-    text = value.lower()
-    if "smart lab" in text or "committee room" in text:
-        return False
-    return (
-        text.startswith("department of ")
-        and (
-        text.endswith("(")
-        or text.endswith("(computer")
-        or text.endswith("committee")
-        or not re.search(
-        r"\b(?:cr|l)[-\s]*\w|\b(?:room|lab)\s+\w", text
-        )
-        )
-    ) or text.endswith("committee") or text.endswith("cr-")
-
-
-def is_combined_header(value: str) -> bool:
-    text = value.strip().lower()
-    if text.startswith("combined class"):
-        return True
-    return bool(re.match(r"^combined\s*\(\d+\)", text))
-
-
 def infer_missing_semesters(timetable: dict) -> None:
-    semester_map: dict[tuple[str, str, str, str], int] = {}
-    conflicts: set[tuple[str, str, str, str]] = set()
-    fallback_map: dict[tuple[str, str, str], set[int]] = {}
-
-    for day_rooms in timetable.values():
-        for sessions in day_rooms.values():
+    known: dict[tuple[str, str, str, str], set[int]] = defaultdict(set)
+    for rooms in timetable.values():
+        for sessions in rooms.values():
             for session in sessions:
-                key = build_semester_key(session)
-                semester = session.get("semester")
-                if not key or semester is None:
-                    continue
-                if key in semester_map and semester_map[key] != semester:
-                    conflicts.add(key)
-                else:
-                    semester_map[key] = semester
-                fallback_key = (key[0], key[2], key[3])
-                fallback_map.setdefault(fallback_key, set()).add(semester)
-
-    for day_rooms in timetable.values():
-        for sessions in day_rooms.values():
+                key = semester_key(session)
+                if key and session["semester"] is not None:
+                    known[key].add(session["semester"])
+    for rooms in timetable.values():
+        for sessions in rooms.values():
             for session in sessions:
-                if session.get("semester") is not None:
-                    continue
-                key = build_semester_key(session)
-                if not key:
-                    continue
-                inferred = None if key in conflicts else semester_map.get(key)
-                if inferred is None:
-                    semesters = fallback_map.get((key[0], key[2], key[3]), set())
-                    inferred = next(iter(semesters)) if len(semesters) == 1 else None
-                if inferred is not None:
-                    session["semester"] = inferred
+                key = semester_key(session)
+                if key and session["semester"] is None and len(known[key]) == 1:
+                    session["semester"] = next(iter(known[key]))
 
 
-def build_semester_key(session: dict) -> tuple[str, str, str, str] | None:
-    degree = session.get("degree")
-    program = session.get("program")
-    section = session.get("section")
-    years = session.get("session")
-    if not degree or not program or not section or not years:
-        return None
-    return (
-        normalize_spacing(str(degree)),
-        normalize_spacing(str(program)),
-        normalize_spacing(str(section)),
-        str(years).replace(" ", ""),
-    )
+def semester_key(session: dict) -> tuple[str, str, str, str] | None:
+    values = (session.get("degree"), session.get("program"), session.get("section"), session.get("session"))
+    return tuple(normalize_spacing(str(value)) for value in values) if all(values) else None
