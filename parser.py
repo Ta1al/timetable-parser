@@ -17,6 +17,8 @@ SECTION_RE = re.compile(r"(Regular|Self Support)\s*\d+", re.IGNORECASE)
 
 PROGRAM_CODES = {"computer science - specialization in artificial intelligence": "AI"}
 PROGRAM_NAMES = {"computer science - specialization in artificial intelligence": "Artificial Intelligence"}
+ROOM_RE = re.compile(r"\b(?:smart room|smart lab|committee room|online|room|hall|lab|cr|l)\b", re.IGNORECASE)
+ROW_GAP_THRESHOLD = 80
 
 
 @dataclass
@@ -101,7 +103,7 @@ def parse_timetable_with_report(
         "warnings": len(report["warnings"]),
     }
     report["status"] = "failed" if not candidates else ("partial" if report["warnings"] else "clean")
-    return {"timestamp": datetime.now().isoformat(), **timetable}, report
+    return {"timestamp": datetime.now().isoformat(), "rooms": report["rooms"], **timetable}, report
 
 
 def extract_candidates(pdf_path: str) -> tuple[list[Candidate], dict]:
@@ -214,16 +216,21 @@ def make_candidates(page: int, region: int, day: str, lines: list[tuple[float, s
     result: list[Candidate] = []
     pending: list[str] = []
     top = 0.0
+    previous_top: float | None = None
     for line_top, text in lines:
         text = normalize_spacing(text)
         if not text:
             continue
+        if previous_top is not None and line_top - previous_top > ROW_GAP_THRESHOLD:
+            pending = []
         if not pending:
             top = line_top
         pending.append(text)
+        previous_top = line_top
         if TIME_RE.search(text):
             result.append(Candidate(page, region, day, top, pending))
             pending = []
+            previous_top = None
     return result
 
 
@@ -254,9 +261,9 @@ def find_rooms(lines: list[dict], day_bounds: dict[str, tuple[float, float]], pa
 
 def looks_like_room(value: str) -> bool:
     text = value.lower()
-    if text.startswith("room / lab"):
+    if re.match(r"^room\s*/\s*lab\b", text):
         return False
-    return bool(re.search(r"\b(?:cr|l|lab|room|hall)[\s-]*[a-z0-9]", text))
+    return bool(ROOM_RE.search(text))
 
 
 def normalize_room_label(value: str) -> str:
@@ -277,15 +284,7 @@ def candidate_room(candidate: Candidate, rooms: list[dict]) -> str | None:
     matches = [item for item in rooms if item["page"] == candidate.page and item["region"] == candidate.region]
     if not matches:
         return None
-    matches.sort(key=lambda item: item["top"])
-    if len(matches) == 1:
-        return matches[0]["room"]
-    for index, item in enumerate(matches):
-        lower = float("-inf") if index == 0 else (matches[index - 1]["top"] + item["top"]) / 2
-        upper = float("inf") if index == len(matches) - 1 else (item["top"] + matches[index + 1]["top"]) / 2
-        if lower <= candidate.top < upper:
-            return item["room"]
-    return None
+    return min(matches, key=lambda item: (abs(item["top"] - candidate.top), item["top"]))["room"]
 
 
 def unique_program_lines(lines: Iterable[str]) -> list[str]:
