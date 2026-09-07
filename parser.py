@@ -52,6 +52,7 @@ class Candidate:
     region: int
     day: str
     top: float
+    bottom: float
     lines: list[str]
 
 
@@ -215,6 +216,7 @@ def crop_lines(lines: list[dict], left: float, right: float) -> list[tuple[float
 def make_candidates(page: int, region: int, day: str, lines: list[tuple[float, str]]) -> list[Candidate]:
     result: list[Candidate] = []
     pending: list[str] = []
+    pending_bottom = 0.0
     top = 0.0
     previous_top: float | None = None
     for line_top, text in lines:
@@ -226,10 +228,12 @@ def make_candidates(page: int, region: int, day: str, lines: list[tuple[float, s
         if not pending:
             top = line_top
         pending.append(text)
+        pending_bottom = line_top
         previous_top = line_top
         if TIME_RE.search(text):
-            result.append(Candidate(page, region, day, top, pending))
+            result.append(Candidate(page, region, day, top, pending_bottom, pending))
             pending = []
+            pending_bottom = 0.0
             previous_top = None
     return result
 
@@ -284,7 +288,8 @@ def candidate_room(candidate: Candidate, rooms: list[dict]) -> str | None:
     matches = [item for item in rooms if item["page"] == candidate.page and item["region"] == candidate.region]
     if not matches:
         return None
-    return min(matches, key=lambda item: (abs(item["top"] - candidate.top), item["top"]))["room"]
+    anchor = candidate.bottom or candidate.top
+    return min(matches, key=lambda item: (abs(item["top"] - anchor), item["top"]))["room"]
 
 
 def unique_program_lines(lines: Iterable[str]) -> list[str]:
